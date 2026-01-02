@@ -2,6 +2,7 @@
 import dbus.service
 import logging
 from openfprintd.device import Device
+from openfprintd.polkit import check_privilege # <--- IMPORT THIS
 
 INTERFACE_NAME = 'net.reactivated.Fprint.Manager'
 
@@ -47,7 +48,11 @@ class Manager(dbus.service.Object):
                          connection_keyword='connection',
                          sender_keyword='sender')
     def RegisterDevice(self, dev, sender, connection):
-        # TODO: polkit: make sure we're talking to a root process!
+        # 1. FIX THE TODO: Enforce Root-only or specific privilege
+        # Using a custom action string, or checking if UID is 0 (root).
+        # Polkit is cleaner. Let's use a generic 'register' action.
+        check_privilege(sender, "net.reactivated.fprint.manager.register")
+        
         logging.debug('RegisterDevice %s %s' % (sender, repr(dev)))
 
         if dev not in self.devices:

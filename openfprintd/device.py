@@ -139,9 +139,15 @@ class Device(dbus.service.Object):
                          sender_keyword='sender')
     def DeleteEnrolledFingers(self, username, sender, connection):
         logging.debug('DeleteEnrolledFingers: %s' % username)
+        
+        # 1. ADD SECURITY CHECK
+        # 'net.reactivated.fprint.device.enroll' is the standard action for modifying prints
+        check_privilege(sender, "net.reactivated.fprint.device.enroll")
 
         uid = self.bus.get_unix_user(sender)
         pw = pwd.getpwuid(uid)
+        
+        # (The original code had a basic check here, Polkit supersedes it but keeping it is fine)
         if username is None or len(username) == 0:
             username = pw.pw_name
         elif username != pw.pw_name and uid != 0:
@@ -269,6 +275,10 @@ class Device(dbus.service.Object):
 
         if self.owner_watcher is None or self.claim_sender != sender:
             raise ClaimDevice()
+
+        # 2. ADD SECURITY CHECK
+        # This will pop up the password prompt in GNOME if not authorized
+        check_privilege(sender, "net.reactivated.fprint.device.enroll")
 
         self.busy = True
         logging.debug('Actually calling target...')
