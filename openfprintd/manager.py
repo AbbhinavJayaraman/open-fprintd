@@ -1,7 +1,8 @@
-
 import dbus.service
 import logging
-from openfprintd.device import Device
+# Import PermissionDenied to raise standardized DBus errors
+from openfprintd.device import Device, PermissionDenied
+import openfprintd.polkit as polkit
 
 INTERFACE_NAME = 'net.reactivated.Fprint.Manager'
 
@@ -47,7 +48,12 @@ class Manager(dbus.service.Object):
                          connection_keyword='connection',
                          sender_keyword='sender')
     def RegisterDevice(self, dev, sender, connection):
-        # TODO: polkit: make sure we're talking to a root process!
+        # Security: Only allow root/admin to register new drivers
+        try:
+            polkit.check_privilege(sender, "net.reactivated.fprint.manager.register")
+        except PermissionError:
+            raise PermissionDenied()
+
         logging.debug('RegisterDevice %s %s' % (sender, repr(dev)))
 
         if dev not in self.devices:
@@ -64,6 +70,12 @@ class Manager(dbus.service.Object):
     def Suspend(self, sender, connection):
         logging.debug('Suspend')
 
+        # Security: Prevent unauthorized users from suspending the service
+        try:
+            polkit.check_privilege(sender, "net.reactivated.fprint.manager.register")
+        except PermissionError:
+            raise PermissionDenied()
+
         for dev in self.devices.values():
             dev.Suspend()
 
@@ -76,6 +88,12 @@ class Manager(dbus.service.Object):
                          sender_keyword='sender')
     def Resume(self, sender, connection):
         logging.debug('Resume')
+
+        # Security: Prevent unauthorized users from resuming the service
+        try:
+            polkit.check_privilege(sender, "net.reactivated.fprint.manager.register")
+        except PermissionError:
+            raise PermissionDenied()
 
         for dev in self.devices.values():
             dev.Resume()

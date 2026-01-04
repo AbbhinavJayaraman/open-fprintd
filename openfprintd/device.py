@@ -1,11 +1,10 @@
-
 import dbus
 import dbus.service
 import logging
 import pwd
 from gi.repository import GLib
 import egis_config 
-
+import openfprintd.polkit as polkit
 
 INTERFACE_NAME = 'net.reactivated.Fprint.Device'
 
@@ -127,6 +126,12 @@ class Device(dbus.service.Object):
             uid=self.bus.get_unix_user(sender)
             pw=pwd.getpwuid(uid)
             username=pw.pw_name
+        else:
+            # Security: Prevent listing other users' fingerprints
+            uid = self.bus.get_unix_user(sender)
+            pw = pwd.getpwuid(uid)
+            if username != pw.pw_name and uid != 0:
+                 raise PermissionDenied()
 
         def cb():
             callback(self.target.ListEnrolledFingers(username, signature='s'))
@@ -140,6 +145,12 @@ class Device(dbus.service.Object):
                          sender_keyword='sender')
     def DeleteEnrolledFingers(self, username, sender, connection):
         logging.debug('DeleteEnrolledFingers: %s' % username)
+
+        # Security: Require auth to delete fingerprints
+        try:
+            polkit.check_privilege(sender, "net.reactivated.fprint.device.enroll")
+        except PermissionError:
+            raise PermissionDenied()
 
         uid = self.bus.get_unix_user(sender)
         pw = pwd.getpwuid(uid)
@@ -160,6 +171,12 @@ class Device(dbus.service.Object):
 
         if self.owner_watcher is None or self.claim_sender != sender:
             raise ClaimDevice()
+
+        # Security: Require auth to delete fingerprints
+        try:
+            polkit.check_privilege(sender, "net.reactivated.fprint.device.enroll")
+        except PermissionError:
+            raise PermissionDenied()
 
         return self.target.DeleteEnrolledFingers(self.claimed_by, signature='s')
 
@@ -230,6 +247,12 @@ class Device(dbus.service.Object):
         if self.owner_watcher is None or self.claim_sender != sender:
             raise ClaimDevice()
 
+        # Security: Require auth to verify
+        try:
+            polkit.check_privilege(sender, "net.reactivated.fprint.device.verify")
+        except PermissionError:
+            raise PermissionDenied()
+
         self.busy = True
         return self.target.VerifyStart(self.claimed_by, finger_name, signature='ss')
 
@@ -271,6 +294,12 @@ class Device(dbus.service.Object):
         if self.owner_watcher is None or self.claim_sender != sender:
             raise ClaimDevice()
 
+        # Security: Require auth to enroll
+        try:
+            polkit.check_privilege(sender, "net.reactivated.fprint.device.enroll")
+        except PermissionError:
+            raise PermissionDenied()
+
         self.busy = True
         logging.debug('Actually calling target...')
         rc = self.target.EnrollStart(self.claimed_by, finger_name, signature='ss')
@@ -308,6 +337,13 @@ class Device(dbus.service.Object):
                          sender_keyword='sender')
     def RunCmd(self, s, sender, connection):
         logging.debug('RunCmd')
+
+        # Security: Require admin privileges for debug commands
+        try:
+            polkit.check_privilege(sender, "net.reactivated.fprint.manager.register")
+        except PermissionError:
+            raise PermissionDenied()
+
         return self.target.RunCmd(s, signature='s')
 
     # ------------------ Props --------------------------

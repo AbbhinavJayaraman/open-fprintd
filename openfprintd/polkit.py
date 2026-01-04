@@ -21,22 +21,45 @@ def check_privilege(sender_dbus_name, action_id):
             None,
         )
 
-        # Structure the request: (system-bus-name, {'name': ':1.99'})
-        subject = GLib.Variant("(s{ss})", ("system-bus-name", {"name": sender_dbus_name}))
+        # 1. Prepare the Subject struct: (sa{sv})
+        # Structure: ("system-bus-name", {"name": <Variant('s', sender_name)>})
+        subject_value = (
+            "system-bus-name", 
+            {"name": GLib.Variant("s", sender_dbus_name)}
+        )
+
+        # 2. Structure the full request parameters
+        # Signature: ((sa{sv})sa{ss}us)
+        # Means: (SubjectStruct, action_id, details_dict, flags, cancellation_id)
+        # Flags: 1 = Allow User Interaction
+        parameters = GLib.Variant(
+            "((sa{sv})sa{ss}us)",
+            (
+                subject_value,
+                action_id,
+                {},  # details (empty dict)
+                1,   # flags (unsigned int 32)
+                ""   # cancellation_id (empty string)
+            )
+        )
         
-        # Call CheckAuthorization
-        # (subject, action_id, details, flags, cancellation_id)
-        # Flags: 1 = Allow User Interaction (Ask for password if needed)
+        # 3. Call CheckAuthorization
         result = authority.call_sync(
             "CheckAuthorization",
-            GLib.Variant("(sa{ss}is)", (subject, action_id, {}, 1, "")),
+            parameters,
             Gio.DBusCallFlags.NONE,
             -1,
             None
         )
         
-        # Result: (is_authorized, is_challenge, details)
-        (is_auth, _, _) = result.unpack()
+        # 4. Unpack the result
+        # The result variant wraps a tuple containing the return struct.
+        # We unpack() once to get the tuple, then take the first element (the struct).
+        result_tuple = result.unpack()
+        struct_val = result_tuple[0]
+        
+        # The struct contains (is_authorized, is_challenge, details)
+        (is_auth, _, _) = struct_val
         
         if not is_auth:
             logging.warning(f"Polkit denied action '{action_id}' for {sender_dbus_name}")
@@ -47,5 +70,5 @@ def check_privilege(sender_dbus_name, action_id):
 
     except Exception as e:
         logging.error(f"Polkit check failed: {e}")
-        # Fail closed (deny) if Polkit is broken
+        # Fail closed (deny) if Polkit is broken or error occurs
         raise PermissionError("Authorization check failed")
