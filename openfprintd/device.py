@@ -2,6 +2,7 @@ import dbus
 import dbus.service
 import logging
 import pwd
+import threading
 from gi.repository import GLib
 import egis_config 
 import openfprintd.polkit as polkit
@@ -10,19 +11,16 @@ INTERFACE_NAME = 'net.reactivated.Fprint.Device'
 
 class AlreadyInUse(dbus.DBusException):
     _dbus_error_name = 'net.reactivated.Fprint.Error.AlreadyInUse'
-
     def __init__(self):
         super().__init__('Device is already in use')
 
 class ClaimDevice(dbus.DBusException):
     _dbus_error_name = 'net.reactivated.Fprint.Error.ClaimDevice'
-
     def __init__(self):
         super().__init__('Client must claim device first')
 
 class PermissionDenied(dbus.DBusException):
     _dbus_error_name = 'net.reactivated.Fprint.Error.PermissionDenied'
-
     def __init__(self):
         super().__init__('Permission denied')
 
@@ -44,9 +42,41 @@ class Device(dbus.service.Object):
         self.claimed_by = None
         self.claim_sender = None
         self.busy = False
-
         self.suspended = False
         self.callbacks = []
+
+    # --- Helper: Async Auth Wrapper ---
+    def _run_with_auth(self, sender, action, success_cb, error_cb, operation_cb):
+        """
+        Runs the Polkit check in a thread to avoid blocking the main loop.
+        If successful, executes operation_cb() on the main thread.
+        """
+        def auth_thread():
+            try:
+                # This blocks, but now it's in a thread so the daemon stays alive
+                polkit.check_privilege(sender, action)
+                # Success! Schedule the actual work on the main loop
+                GLib.idle_add(run_op)
+            except Exception:
+                # Map all auth failures to PermissionDenied
+                GLib.idle_add(error_cb, PermissionDenied())
+
+        def run_op():
+            try:
+                # Execute the actual DBus target call
+                result = operation_cb()
+                # If the target returned a value, pass it back, else just None
+                if result is not None:
+                    success_cb(result)
+                else:
+                    success_cb()
+            except Exception as e:
+                error_cb(e)
+
+        t = threading.Thread(target=auth_thread)
+        t.start()
+
+    # --- Standard Methods ---
 
     def proxy_call(self, cb):
         if self.suspended or self.target is None:
@@ -55,16 +85,10 @@ class Device(dbus.service.Object):
         else:
             cb()
 
-
     def call_cbs(self):
         for cb in self.callbacks:
-            try:
-                cb()
-            except Exception as e:
-                logging.debug('callback resulted in error: %s' % repr(e))
-
-        logging.debug('Callbacks complete')
-
+            try: cb()
+            except Exception as e: logging.debug('callback error: %s' % repr(e))
         self.suspended = False
         self.callbacks = []
 
@@ -78,20 +102,13 @@ class Device(dbus.service.Object):
         watcher = None
         def watch_cb(name):
             if name == '':
-                logging.debug('%s went offline' % sender)
                 self.unset_target()
-                #self.remove_from_connection()
                 watcher.cancel()
         watcher = self.connection.watch_name_owner(sender, watch_cb)
-
-        # We called from RegisterDeivce DBus method. 
-        # Calling device methods from here will cause a deadlock.
-        # Postpone processing till RegisterDeivce method is finished.
 
         def process_offline():
             if not self.suspended:
                 self.call_cbs()
-
         GLib.idle_add(process_offline)
 
     def unset_target(self):
@@ -99,15 +116,12 @@ class Device(dbus.service.Object):
 
     def Resume(self):
         self.suspended = False
-
         if self.target is not None:
             self.target.Resume()
-
             self.call_cbs()
 
     def Suspend(self):
         self.suspended = True
-
         if self.target is not None:
             self.target.Suspend()
 
@@ -121,13 +135,11 @@ class Device(dbus.service.Object):
                          async_callbacks=('callback', 'errback'))
     def ListEnrolledFingers(self, username, sender, connection, callback, errback):
         logging.debug('ListEnrolledFingers')
-
         if username is None or username == '':
             uid=self.bus.get_unix_user(sender)
             pw=pwd.getpwuid(uid)
             username=pw.pw_name
         else:
-            # Security: Prevent listing other users' fingerprints
             uid = self.bus.get_unix_user(sender)
             pw = pwd.getpwuid(uid)
             if username != pw.pw_name and uid != 0:
@@ -135,50 +147,44 @@ class Device(dbus.service.Object):
 
         def cb():
             callback(self.target.ListEnrolledFingers(username, signature='s'))
-
         self.proxy_call(cb)
 
     @dbus.service.method(dbus_interface=INTERFACE_NAME,
                          in_signature='s', 
                          out_signature='',
                          connection_keyword='connection',
-                         sender_keyword='sender')
-    def DeleteEnrolledFingers(self, username, sender, connection):
+                         sender_keyword='sender',
+                         async_callbacks=('success_cb', 'error_cb'))
+    def DeleteEnrolledFingers(self, username, sender, connection, success_cb, error_cb):
         logging.debug('DeleteEnrolledFingers: %s' % username)
+        
+        def op():
+            uid = self.bus.get_unix_user(sender)
+            pw = pwd.getpwuid(uid)
+            target_user = username
+            if target_user is None or len(target_user) == 0:
+                target_user = pw.pw_name
+            elif target_user != pw.pw_name and uid != 0:
+                raise PermissionDenied()
+            return self.target.DeleteEnrolledFingers(target_user, signature='s')
 
-        # Security: Require auth to delete fingerprints
-        try:
-            polkit.check_privilege(sender, "net.reactivated.fprint.device.enroll")
-        except PermissionError:
-            raise PermissionDenied()
-
-        uid = self.bus.get_unix_user(sender)
-        pw = pwd.getpwuid(uid)
-        if username is None or len(username) == 0:
-            username = pw.pw_name
-        elif username != pw.pw_name and uid != 0:
-            raise PermissionDenied()
-
-        return self.target.DeleteEnrolledFingers(username, signature='s')
+        self._run_with_auth(sender, "net.reactivated.fprint.device.enroll", success_cb, error_cb, op)
 
     @dbus.service.method(dbus_interface=INTERFACE_NAME,
                          in_signature='', 
                          out_signature='',
                          connection_keyword='connection',
-                         sender_keyword='sender')
-    def DeleteEnrolledFingers2(self, sender, connection):
+                         sender_keyword='sender',
+                         async_callbacks=('success_cb', 'error_cb'))
+    def DeleteEnrolledFingers2(self, sender, connection, success_cb, error_cb):
         logging.debug('DeleteEnrolledFingers2')
+        
+        def op():
+            if self.owner_watcher is None or self.claim_sender != sender:
+                raise ClaimDevice()
+            return self.target.DeleteEnrolledFingers(self.claimed_by, signature='s')
 
-        if self.owner_watcher is None or self.claim_sender != sender:
-            raise ClaimDevice()
-
-        # Security: Require auth to delete fingerprints
-        try:
-            polkit.check_privilege(sender, "net.reactivated.fprint.device.enroll")
-        except PermissionError:
-            raise PermissionDenied()
-
-        return self.target.DeleteEnrolledFingers(self.claimed_by, signature='s')
+        self._run_with_auth(sender, "net.reactivated.fprint.device.enroll", success_cb, error_cb, op)
 
     # ------------------ Claim/Release --------------------------
 
@@ -189,7 +195,6 @@ class Device(dbus.service.Object):
                          sender_keyword='sender')
     def Claim(self, username, sender, connection):
         logging.debug('Claim')
-
         uid=self.bus.get_unix_user(sender)
         pw=pwd.getpwuid(uid)
         if username is None or len(username) == 0:
@@ -215,21 +220,17 @@ class Device(dbus.service.Object):
                          sender_keyword='sender')
     def Release(self, sender, connection):
         logging.debug('Release')
-
         if self.owner_watcher is None or self.claim_sender != sender:
             raise ClaimDevice()
-        
         self.do_release()
 
     def do_release(self):
         logging.debug('do_release')
         self.claimed_by = None
         self.claim_sender = None
-
         if self.owner_watcher is not None:
             self.owner_watcher.cancel()
             self.owner_watcher = None
-
         if self.busy:
             self.target.Cancel(signature='')
             self.busy = False
@@ -240,23 +241,18 @@ class Device(dbus.service.Object):
                          in_signature='s', 
                          out_signature='',
                          connection_keyword='connection',
-                         sender_keyword='sender')
-    def VerifyStart(self, finger_name, sender, connection):
+                         sender_keyword='sender',
+                         async_callbacks=('success_cb', 'error_cb'))
+    def VerifyStart(self, finger_name, sender, connection, success_cb, error_cb):
         logging.debug('VerifyStart requested')
+        
+        def op():
+            if self.owner_watcher is None or self.claim_sender != sender:
+                raise ClaimDevice()
+            self.busy = True
+            return self.target.VerifyStart(self.claimed_by, finger_name, signature='ss')
 
-        # Polkit check FIRST
-        # This prevents blocking the state machine if the user takes time to auth
-        try:
-            polkit.check_privilege(sender, "net.reactivated.fprint.device.verify")
-        except PermissionError:
-            raise PermissionDenied()
-
-        if self.owner_watcher is None or self.claim_sender != sender:
-            raise ClaimDevice()
-
-        self.busy = True
-        return self.target.VerifyStart(self.claimed_by, finger_name, signature='ss')
-
+        self._run_with_auth(sender, "net.reactivated.fprint.device.verify", success_cb, error_cb, op)
 
     @dbus.service.method(dbus_interface=INTERFACE_NAME,
                          in_signature='', 
@@ -265,22 +261,17 @@ class Device(dbus.service.Object):
                          sender_keyword='sender')
     def VerifyStop(self, sender, connection):
         logging.debug('VerifyStop')
-
         if self.owner_watcher is None or self.claim_sender != sender:
             raise ClaimDevice()
-        
         self.busy = False
         self.target.Cancel(signature='')
 
     @dbus.service.signal(dbus_interface=INTERFACE_NAME, signature='s')
-    def VerifyFingerSelected(self, finger):
-        logging.debug('VerifyFingerSelected')
+    def VerifyFingerSelected(self, finger): pass
 
     @dbus.service.signal(dbus_interface=INTERFACE_NAME, signature='sb')
     def VerifyStatus(self, result, done):
-        logging.debug('VerifyStatus')
-        if done:
-            self.busy = False
+        if done: self.busy = False
 
     # ------------------ Enroll --------------------------
 
@@ -288,24 +279,18 @@ class Device(dbus.service.Object):
                          in_signature='s', 
                          out_signature='',
                          connection_keyword='connection',
-                         sender_keyword='sender')
-    def EnrollStart(self, finger_name, sender, connection):
+                         sender_keyword='sender',
+                         async_callbacks=('success_cb', 'error_cb'))
+    def EnrollStart(self, finger_name, sender, connection, success_cb, error_cb):
         logging.debug('EnrollStart requested')
-        
-        # Polkit check FIRST
-        # This prevents blocking the state machine if the user takes time to auth
-        try:
-            polkit.check_privilege(sender, "net.reactivated.fprint.device.enroll")
-        except PermissionError:
-            raise PermissionDenied()
 
-        if self.owner_watcher is None or self.claim_sender != sender:
-            raise ClaimDevice()
+        def op():
+            if self.owner_watcher is None or self.claim_sender != sender:
+                raise ClaimDevice()
+            self.busy = True
+            return self.target.EnrollStart(self.claimed_by, finger_name, signature='ss')
 
-        self.busy = True
-        logging.debug('Polkit auth successful, starting bridge enrollment...')
-        return self.target.EnrollStart(self.claimed_by, finger_name, signature='ss')
-
+        self._run_with_auth(sender, "net.reactivated.fprint.device.enroll", success_cb, error_cb, op)
 
     @dbus.service.method(dbus_interface=INTERFACE_NAME,
                          in_signature='', 
@@ -314,19 +299,14 @@ class Device(dbus.service.Object):
                          sender_keyword='sender')
     def EnrollStop(self, sender, connection):
         logging.debug('EnrollStop')
-
         if self.owner_watcher is None or self.claim_sender != sender:
             raise ClaimDevice()
-
         self.busy = False
         self.target.Cancel(signature='')
 
-
     @dbus.service.signal(dbus_interface=INTERFACE_NAME, signature='sb')
     def EnrollStatus(self, result, done):
-        logging.debug('EnrollStatus')
-        if done:
-            self.busy = False
+        if done: self.busy = False
 
     # ------------------ Debug --------------------------
 
@@ -334,40 +314,31 @@ class Device(dbus.service.Object):
                          in_signature='s', 
                          out_signature='s',
                          connection_keyword='connection',
-                         sender_keyword='sender')
-    def RunCmd(self, s, sender, connection):
+                         sender_keyword='sender',
+                         async_callbacks=('success_cb', 'error_cb'))
+    def RunCmd(self, s, sender, connection, success_cb, error_cb):
         logging.debug('RunCmd')
-
-        # Security: Require admin privileges for debug commands
-        try:
-            polkit.check_privilege(sender, "net.reactivated.fprint.manager.register")
-        except PermissionError:
-            raise PermissionDenied()
-
-        return self.target.RunCmd(s, signature='s')
+        def op():
+            return self.target.RunCmd(s, signature='s')
+        self._run_with_auth(sender, "net.reactivated.fprint.manager.register", success_cb, error_cb, op)
 
     # ------------------ Props --------------------------
 
     @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature='ss', out_signature='v')
     def Get(self, interface, prop):
         logging.debug('Get %s.%s' % (interface, prop))
-        
         return self.GetAll(interface)[prop]
 
     @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature='ssv')
     def Set(self, interface, prop, value):
         logging.debug('Set %s.%s=%s' % (interface, prop, repr(value)))
-        
         if interface != INTERFACE_NAME:
             raise dbus.exceptions.DBusException('net.reactivated.Fprint.Error.UnknownInterface')
-        
         raise dbus.exceptions.DBusException('net.reactivated.Fprint.Error.NotImplemented')
 
     @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature='s', out_signature='a{sv}')
     def GetAll(self, interface):
         logging.debug('GetAll %s' % (interface))
-        
         if interface != INTERFACE_NAME:
             raise dbus.exceptions.DBusException('net.reactivated.Fprint.Error.UnknownInterface')
-
         return self.target_props
