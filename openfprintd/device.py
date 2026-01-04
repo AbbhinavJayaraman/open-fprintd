@@ -242,16 +242,17 @@ class Device(dbus.service.Object):
                          connection_keyword='connection',
                          sender_keyword='sender')
     def VerifyStart(self, finger_name, sender, connection):
-        logging.debug('VerifyStart')
+        logging.debug('VerifyStart requested')
 
-        if self.owner_watcher is None or self.claim_sender != sender:
-            raise ClaimDevice()
-
-        # Security: Require auth to verify
+        # Polkit check FIRST
+        # This prevents blocking the state machine if the user takes time to auth
         try:
             polkit.check_privilege(sender, "net.reactivated.fprint.device.verify")
         except PermissionError:
             raise PermissionDenied()
+
+        if self.owner_watcher is None or self.claim_sender != sender:
+            raise ClaimDevice()
 
         self.busy = True
         return self.target.VerifyStart(self.claimed_by, finger_name, signature='ss')
@@ -289,22 +290,21 @@ class Device(dbus.service.Object):
                          connection_keyword='connection',
                          sender_keyword='sender')
     def EnrollStart(self, finger_name, sender, connection):
-        logging.debug('EnrollStart')
-
-        if self.owner_watcher is None or self.claim_sender != sender:
-            raise ClaimDevice()
-
-        # Security: Require auth to enroll
+        logging.debug('EnrollStart requested')
+        
+        # Polkit check FIRST
+        # This prevents blocking the state machine if the user takes time to auth
         try:
             polkit.check_privilege(sender, "net.reactivated.fprint.device.enroll")
         except PermissionError:
             raise PermissionDenied()
 
+        if self.owner_watcher is None or self.claim_sender != sender:
+            raise ClaimDevice()
+
         self.busy = True
-        logging.debug('Actually calling target...')
-        rc = self.target.EnrollStart(self.claimed_by, finger_name, signature='ss')
-        logging.debug('...rc=%s' % repr(rc))
-        return rc
+        logging.debug('Polkit auth successful, starting bridge enrollment...')
+        return self.target.EnrollStart(self.claimed_by, finger_name, signature='ss')
 
 
     @dbus.service.method(dbus_interface=INTERFACE_NAME,

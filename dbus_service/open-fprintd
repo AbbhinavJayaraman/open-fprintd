@@ -8,10 +8,6 @@ from gi.repository import GLib
 import logging
 import argparse
 
-# --- ADD THIS LINE ---
-import egis_driver
-# ---------------------
-
 from openfprintd.manager import Manager
 
 
