@@ -4,7 +4,7 @@ import dbus.service
 import logging
 import pwd
 from gi.repository import GLib
-from .. import egis_config 
+import egis_config 
 
 
 INTERFACE_NAME = 'net.reactivated.Fprint.Device'
